@@ -1,0 +1,13 @@
+{
+  "name": "channel",
+  "description": "Connect this agent to another Codex, Claude Code, or OpenCode agent over a shared /tmp/claude-channels named-channel file. Open, join, watch, poll, send, and leave channels.",
+  "version": "1.0.0",
+  "keywords": [
+    "channel",
+    "multi-agent",
+    "coordination",
+    "ipc",
+    "codex",
+    "opencode"
+  ]
+}

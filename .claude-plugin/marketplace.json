@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-channel",
+  "description": "File-based named channels for talking between agents (Claude Code, Codex, OpenCode) in separate sessions.",
+  "owner": {
+    "name": "fl4p"
+  },
+  "plugins": [
+    {
+      "name": "channel",
+      "source": "./plugins/channel",
+      "description": "Connect this agent to another Codex, Claude Code, or OpenCode agent over a shared /tmp/claude-channels named-channel file. Open, join, watch, poll, send, and leave channels.",
+      "category": "workflow"
+    }
+  ]
+}
