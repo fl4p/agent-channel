@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
 import json
 import os
 import platform
@@ -149,6 +150,60 @@ def collect_new(file: Path, cursor: Path, me: str):
     return messages, total
 
 
+# --- Linux inotify receive path (stdlib ctypes; no third-party deps) --------
+# Mirrors the kqueue WRITE|EXTEND|DELETE|RENAME watch set below, so Linux gets
+# the same zero-CPU, event-driven wait that macOS/BSD already have instead of
+# degrading to the sleep-poll fallback.
+_IN_MODIFY = 0x00000002
+_IN_CLOSE_WRITE = 0x00000008
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_INOTIFY_MASK = _IN_MODIFY | _IN_CLOSE_WRITE | _IN_DELETE_SELF | _IN_MOVE_SELF
+_inotify_lib = None
+
+
+def _inotify_libc():
+    """Bind libc inotify calls once via ctypes. None if unavailable."""
+    global _inotify_lib
+    if _inotify_lib is None:
+        try:
+            lib = ctypes.CDLL("libc.so.6", use_errno=True)
+            lib.inotify_init1.argtypes = [ctypes.c_int]
+            lib.inotify_init1.restype = ctypes.c_int
+            lib.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            lib.inotify_add_watch.restype = ctypes.c_int
+            _inotify_lib = lib
+        except (OSError, AttributeError):
+            _inotify_lib = False  # cache the failure; don't retry libc each loop
+    return _inotify_lib or None
+
+
+def _wait_inotify(file: Path, observed_total: int, timeout):
+    """Block on Linux inotify until ``file`` changes or ``timeout`` elapses.
+
+    Returns True if it changed (or may have), False on timeout, and None if
+    inotify could not be set up so the caller falls back to the bounded sleep.
+    A fresh inotify fd per call keeps the watch armed *before* the race recheck
+    below, closing the lost-wakeup window between the last read and arming the
+    watch -- the same ordering the kqueue path uses.
+    """
+    libc = _inotify_libc()
+    if libc is None:
+        return None
+    fd = libc.inotify_init1(os.O_NONBLOCK)
+    if fd < 0:
+        return None
+    try:
+        if libc.inotify_add_watch(fd, os.fsencode(str(file)), _INOTIFY_MASK) < 0:
+            return None
+        if line_count(file) != observed_total:
+            return True
+        rlist, _, _ = select.select([fd], [], [], timeout)
+        return bool(rlist)  # event fired (True) vs timed out (False)
+    finally:
+        os.close(fd)
+
+
 def wait_for_file_change(file: Path, observed_total: int, timeout, fallback_interval: float) -> bool:
     """Wait until the channel file changes.
 
@@ -179,6 +234,11 @@ def wait_for_file_change(file: Path, observed_total: int, timeout, fallback_inte
         finally:
             kq.close()
             os.close(fd)
+
+    if sys.platform.startswith("linux"):
+        result = _wait_inotify(file, observed_total, timeout)
+        if result is not None:
+            return result
 
     sleep_for = fallback_interval
     if timeout is not None:
