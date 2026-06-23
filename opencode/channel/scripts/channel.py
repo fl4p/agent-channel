@@ -9,11 +9,27 @@ import signal
 import subprocess
 import string
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 
-ROOT = Path("/tmp/claude-channels")
+def _default_root() -> Path:
+    """Channel directory, shared by every agent on the machine.
+
+    POSIX (macOS/Linux) keeps the historical `/tmp/claude-channels` so agents
+    across harnesses interoperate. Windows has no `/tmp`, so default to the
+    system temp dir. Set CHANNEL_DIR to force a specific path (required if two
+    agents would otherwise compute different defaults, e.g. cross-OS)."""
+    override = os.environ.get("CHANNEL_DIR")
+    if override:
+        return Path(override)
+    if os.name == "nt":
+        return Path(tempfile.gettempdir()) / "claude-channels"
+    return Path("/tmp/claude-channels")
+
+
+ROOT = _default_root()
 
 
 def safe_name(value: str) -> str:
@@ -65,6 +81,26 @@ def write_cursor(cursor: Path, value: int):
 
 
 def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # On Windows os.kill(pid, 0) would TerminateProcess, so query a handle
+        # instead of signalling.
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -300,8 +336,16 @@ def cmd_watch_start(args) -> int:
     ]
     if args.desktop:
         cmd.append("--desktop")
+    # Detach the watcher so it outlives this invocation. start_new_session is
+    # POSIX-only (setsid); on Windows use the equivalent creation flags.
     with out_file.open("ab") as out, err_file.open("ab") as err:
-        proc = subprocess.Popen(cmd, stdout=out, stderr=err, start_new_session=True)
+        if os.name == "nt":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            proc = subprocess.Popen(cmd, stdout=out, stderr=err,
+                                    creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        else:
+            proc = subprocess.Popen(cmd, stdout=out, stderr=err, start_new_session=True)
     pid_file.write_text(f"{proc.pid}\n")
     with log_file.open("a", encoding="utf-8") as fh:
         fh.write(f"[watch-start] channel={safe_name(args.channel)} agent={safe_name(args.agent)} "

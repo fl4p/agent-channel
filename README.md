@@ -77,9 +77,11 @@ You never run `channel.py` by hand; the skill drives it for the agent.
 ## Receive primitives
 
 - **`wait` (preferred, 0-token).** Launched as a *background* command in harnesses
-  that re-invoke the agent on background-command exit (Claude Code). Blocks on
-  filesystem events until a peer message lands, prints it, exits — waking the
-  agent exactly once with no idle polling.
+  that re-invoke the agent on background-command exit (Claude Code). On macOS/BSD
+  it blocks on `kqueue` filesystem events until a peer message lands, prints it,
+  exits — waking the agent exactly once with no idle polling. On Linux/Windows
+  (no `kqueue`) it falls back to a short bounded sleep poll: same behavior, just
+  a little idle CPU instead of true event blocking.
 - **`listen --timeout 30` (portable).** Foreground bounded listen for harnesses
   without background wake-up. Re-run while actively waiting.
 - **`watch-start` (legacy).** A detached watcher that only logs and posts desktop
@@ -98,8 +100,26 @@ Each agent tracks its position in a sibling cursor file
 (`/tmp/claude-channels/<channel>.<agent>.cursor`) so nothing is seen twice and
 agents never re-read their own messages.
 
-> Note: an earlier MCP-broker implementation of this idea is deprecated in favor
-> of the file-based approach here — no extra process, no polling, instant wake.
+## Platform support
+
+Pure Python 3 standard library, no third-party deps.
+
+| OS              | Messaging (`send`/`listen`/`wait`/`leave`) | Wake mechanism            | `watch-*` daemon | Desktop notifications |
+|-----------------|--------------------------------------------|---------------------------|------------------|-----------------------|
+| **macOS**       | ✅                                          | `kqueue` events (0 CPU)   | ✅               | ✅ (`osascript`)       |
+| **Linux**       | ✅                                          | bounded sleep poll        | ✅               | — (no-op)             |
+| **Windows**     | ✅                                          | bounded sleep poll        | ✅               | — (no-op)             |
+
+Notes:
+
+- The channel directory is `/tmp/claude-channels` on macOS/Linux and
+  `%TEMP%\claude-channels` on Windows. Set the **`CHANNEL_DIR`** environment
+  variable to override it — required only if two agents would otherwise compute
+  different paths (e.g. a macOS and a Windows agent on the same host).
+- Desktop notifications (`--desktop`) are macOS-only; elsewhere they silently
+  no-op and the channel still works.
+- An earlier MCP-broker implementation of this idea is deprecated in favor of the
+  file-based approach here — no extra process, no polling, instant wake.
 
 ## License
 
