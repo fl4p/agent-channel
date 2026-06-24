@@ -77,11 +77,12 @@ You never run `channel.py` by hand; the skill drives it for the agent.
 ## Receive primitives
 
 - **`wait` (preferred, 0-token).** Launched as a *background* command in harnesses
-  that re-invoke the agent on background-command exit (Claude Code). On macOS/BSD
-  it blocks on `kqueue` filesystem events until a peer message lands, prints it,
-  exits — waking the agent exactly once with no idle polling. On Linux/Windows
-  (no `kqueue`) it falls back to a short bounded sleep poll: same behavior, just
-  a little idle CPU instead of true event blocking.
+  that re-invoke the agent on background-command exit (Claude Code). It blocks on
+  real filesystem events until a peer message lands, prints it, exits — waking the
+  agent exactly once with **zero idle CPU**: `kqueue` on macOS/BSD, `inotify` on
+  Linux (glibc *and* musl/Alpine). Windows, and any host where neither watcher can
+  be set up, fall back to a short bounded sleep poll — same behavior, just a little
+  idle CPU instead of true event blocking.
 - **`listen --timeout 30` (portable).** Foreground bounded listen for harnesses
   without background wake-up. Re-run while actively waiting.
 - **`watch-start` (legacy).** A detached watcher that only logs and posts desktop
@@ -104,11 +105,17 @@ agents never re-read their own messages.
 
 Pure Python 3 standard library, no third-party deps.
 
-| OS              | Messaging (`send`/`listen`/`wait`/`leave`) | Wake mechanism            | `watch-*` daemon | Desktop notifications |
-|-----------------|--------------------------------------------|---------------------------|------------------|-----------------------|
-| **macOS**       | ✅                                          | `kqueue` events (0 CPU)   | ✅               | ✅ (`osascript`)       |
-| **Linux**       | ✅                                          | bounded sleep poll        | ✅               | — (no-op)             |
-| **Windows**     | ✅                                          | bounded sleep poll        | ✅               | — (no-op)             |
+| OS                    | Messaging (`send`/`listen`/`wait`/`leave`) | Wake mechanism           | `watch-*` daemon | Desktop notifications |
+|-----------------------|--------------------------------------------|--------------------------|------------------|-----------------------|
+| **macOS**             | ✅                                          | `kqueue` events (0 CPU)  | ✅               | ✅ (`osascript`)       |
+| **Linux** (glibc)     | ✅                                          | `inotify` events (0 CPU) | ✅               | — (no-op)             |
+| **Linux** (musl/Alpine) | ✅                                        | `inotify` events (0 CPU) | ✅               | — (no-op)             |
+| **Windows**           | ✅                                          | bounded sleep poll       | ✅               | — (no-op)             |
+
+`wait`/`listen` block on native filesystem events with zero idle CPU on macOS
+(`kqueue`) and Linux (`inotify`). Anywhere a watcher can't be set up — Windows,
+or an exotic host — they degrade to a short bounded sleep poll: identical
+behavior, just a little idle CPU.
 
 Notes:
 
@@ -120,6 +127,11 @@ Notes:
   no-op and the channel still works.
 - An earlier MCP-broker implementation of this idea is deprecated in favor of the
   file-based approach here — no extra process, no polling, instant wake.
+
+**Tested on:** macOS (kqueue), Linux glibc (`python:3-slim`) and musl
+(`python:3-alpine`) — both confirmed holding an `inotify` fd at zero idle CPU and
+waking on a peer send — and Windows Python (via Wine: `%TEMP%` path, `ctypes`
+`pid_alive`, and the detached `watch-*` daemon all verified).
 
 ## License
 
