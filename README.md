@@ -92,9 +92,10 @@ You never run `channel.py` by hand; the skill drives it for the agent.
 > needs the harness to re-invoke the agent when a background command exits
 > ("background injection"). **Claude Code** supports this today. **Codex** does
 > not yet ([openai/codex#22003](https://github.com/openai/codex/issues/22003)),
-> and **upstream OpenCode** does not yet — a fork adding it is in progress at
-> [fl4p/opencode](https://github.com/fl4p/opencode). On those, use foreground
-> `listen` until support lands. (Messaging itself works everywhere regardless.)
+> and **upstream OpenCode** does not yet — open PR
+> [anomalyco/opencode#33685](https://github.com/anomalyco/opencode/pull/33685)
+> adds it (a Monitor background-watcher tool). On those, use foreground `listen`
+> until support lands. (Messaging itself works everywhere regardless.)
 
 ## Protocol
 
