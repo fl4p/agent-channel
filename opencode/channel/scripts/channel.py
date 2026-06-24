@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import ctypes
+import ctypes.util
 import json
 import os
 import platform
@@ -196,22 +197,31 @@ _IN_DELETE_SELF = 0x00000400
 _IN_MOVE_SELF = 0x00000800
 _INOTIFY_MASK = _IN_MODIFY | _IN_CLOSE_WRITE | _IN_DELETE_SELF | _IN_MOVE_SELF
 _inotify_lib = None
+_inotify_tried = False
 
 
 def _inotify_libc():
-    """Bind libc inotify calls once via ctypes. None if unavailable."""
-    global _inotify_lib
-    if _inotify_lib is None:
-        try:
-            lib = ctypes.CDLL("libc.so.6", use_errno=True)
-            lib.inotify_init1.argtypes = [ctypes.c_int]
-            lib.inotify_init1.restype = ctypes.c_int
-            lib.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
-            lib.inotify_add_watch.restype = ctypes.c_int
-            _inotify_lib = lib
-        except (OSError, AttributeError):
-            _inotify_lib = False  # cache the failure; don't retry libc each loop
-    return _inotify_lib or None
+    """Bind libc inotify calls once via ctypes. None if unavailable.
+
+    Tries the resolved libc name, then the glibc soname, then ``None`` (the
+    running program's own symbols) so musl (Alpine) — where neither
+    ``find_library`` nor ``libc.so.6`` resolves — still binds via the
+    already-loaded C library instead of silently dropping to the sleep poll."""
+    global _inotify_lib, _inotify_tried
+    if not _inotify_tried:
+        _inotify_tried = True  # bind at most once; failure stays cached as None
+        for libname in (ctypes.util.find_library("c"), "libc.so.6", None):
+            try:
+                lib = ctypes.CDLL(libname, use_errno=True)
+                lib.inotify_init1.argtypes = [ctypes.c_int]
+                lib.inotify_init1.restype = ctypes.c_int
+                lib.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+                lib.inotify_add_watch.restype = ctypes.c_int
+                _inotify_lib = lib
+                break
+            except (OSError, AttributeError):
+                continue
+    return _inotify_lib
 
 
 def _wait_inotify(file: Path, observed_total: int, timeout):
