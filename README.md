@@ -88,6 +88,14 @@ You never run `channel.py` by hand; the skill drives it for the agent.
 - **`watch-start` (legacy).** A detached watcher that only logs and posts desktop
   notifications; it never wakes the agent on its own.
 
+> **Harness support for background `wait`.** The zero-token background `wait`
+> needs the harness to re-invoke the agent when a background command exits
+> ("background injection"). **Claude Code** supports this today. **Codex** does
+> not yet ([openai/codex#22003](https://github.com/openai/codex/issues/22003)),
+> and **upstream OpenCode** does not yet — a fork adding it is in progress at
+> [fl4p/opencode](https://github.com/fl4p/opencode). On those, use foreground
+> `listen` until support lands. (Messaging itself works everywhere regardless.)
+
 ## Protocol
 
 Shared transcript — append-only NDJSON, one JSON object per line:

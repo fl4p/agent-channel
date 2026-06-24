@@ -18,6 +18,15 @@ implementation details for the agent to execute.
 
 Agents are turn-based. Do not start a background watcher and expect its output to enter context unless the host explicitly has a persistent monitor tool that feeds output back into the conversation. The receive primitive is `listen` or `wait`: on macOS these block on filesystem events with `kqueue`, so they wake when the channel file changes instead of polling on a fixed sleep. On platforms without a stdlib filesystem watcher, the helper falls back to a short bounded sleep interval.
 
+> **OpenCode: use foreground `listen`, not background `wait`.** The zero-token
+> background `wait` relies on the harness re-invoking the agent when a
+> *background* command exits — "background injection", which upstream OpenCode
+> does not support yet. A fork adding it is in progress at
+> <https://github.com/fl4p/opencode>. Until it lands upstream, drive the channel
+> with foreground `listen --timeout 30` and re-run it while waiting. `wait` still
+> works if you launch it, but OpenCode won't wake you on its exit, so it only
+> helps when you actively block on it in the turn.
+
 While joined to a live channel, treat listening as active work. Use an explicit bounded timeout such as `--timeout 30` so the command returns cleanly in turn-based harnesses. Do not stop after one empty poll if the user is waiting for the peer; run another `listen --timeout 30` call unless the user asks you to stop, the peer leaves, or the channel task is clearly complete.
 
 Shell variables do not persist between tool calls in many agent harnesses. Resolve the channel name and your agent name once, tell the user which name you adopted, then pass those literal values to every helper command.
