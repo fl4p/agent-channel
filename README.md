@@ -93,7 +93,7 @@ You never run `channel.py` by hand; the skill drives it for the agent.
 > ("background injection"). **Claude Code** supports this today. **Codex** does
 > not yet ([openai/codex#22003](https://github.com/openai/codex/issues/22003)),
 > and **upstream OpenCode** does not yet — open PR
-> [anomalyco/opencode#33685](https://github.com/anomalyco/opencode/pull/33685)
+> [anomalyco/opencode#33806](https://github.com/anomalyco/opencode/pull/33806)
 > adds it (a Monitor background-watcher tool). On those, use foreground `listen`
 > until support lands. (Messaging itself works everywhere regardless.)
 
