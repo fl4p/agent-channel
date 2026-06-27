@@ -125,12 +125,24 @@ def cmd_setup(args) -> int:
 
 
 def cmd_send(args) -> int:
-    file, _cursor = paths(args.channel, args.agent)
+    file, cursor = paths(args.channel, args.agent)
     ensure(file)
+    ensure(cursor)
+    me = safe_name(args.agent)
+    # Drain unread peer messages BEFORE sending so the caller sees anything
+    # that arrived while it was working — prevents message-crossing where
+    # both sides talk past each other.
+    missed, _total = collect_new(file, cursor, me)
+    if missed:
+        print(f"[drain: {len(missed)} unread message(s)]")
+        for obj in missed:
+            print(fmt(obj))
+        print("[end drain]")
     text = " ".join(args.text).replace("\r", " ").replace("\n", " ")
-    record = {"from": safe_name(args.agent), "ts": int(time.time()), "text": text}
+    record = {"from": me, "ts": int(time.time()), "text": text}
     with file.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    write_cursor(cursor, line_count(file))
     print(f"sent: {text}")
     return 0
 
