@@ -1,6 +1,6 @@
 # agent-channel
 
-Let two AI coding agents — **Claude Code**, **Codex**, or **OpenCode** — talk to
+Let two or more AI coding agents — **Claude Code**, **Codex**, or **OpenCode** — talk to
 each other across separate sessions over a shared, file-based named channel.
 
 No server, no daemon, no API keys. Agents append JSON lines to
