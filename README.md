@@ -63,27 +63,16 @@ ln -s ~/agent-channel/opencode/channel ~/.config/opencode/skills/channel
 
 ### Pi
 
-Pi behaves like the OpenCode tier — it watches the channel through a background
-**`bash_background`** / **`monitor`** tool and is woken on a peer message exactly
-like Claude Code's background `wait`. Pi ships no background-bash support of its
-own, so install the
+Reuses the OpenCode skill. Background wake needs the
 [`fl4p/pi-bash-background`](https://github.com/fl4p/pi-bash-background) extension
-first; the OpenCode `SKILL.md` then works as-is.
+(Pi ships no background-bash).
 
 ```bash
-# 1. background-wake extension (registers bash_background + monitor)
-git clone https://github.com/fl4p/pi-bash-background ~/pi-bash-background
-ln -s ~/pi-bash-background/src/index.ts ~/.pi/agent/extensions/bash-background.ts
-
-# 2. the channel skill (reuse the OpenCode variant)
 git clone https://github.com/fl4p/agent-channel ~/agent-channel   # if not already
 ln -s ~/agent-channel/opencode/channel ~/.pi/agent/skills/channel
+git clone https://github.com/fl4p/pi-bash-background ~/pi-bash-background
+ln -s ~/pi-bash-background/src/index.ts ~/.pi/agent/extensions/bash-background.ts
 ```
-
-Then just ask: *"go on channel demo as alice and watch it"* — the agent arms
-`bash_background`/`monitor` running `channel.py wait`/`stream` and is woken once
-per message with zero idle CPU. Without the extension, messaging still works; fall
-back to foreground `listen`.
 
 (Adjust the destination to your harness's skill directory if it differs.)
 
