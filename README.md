@@ -63,13 +63,18 @@ ln -s ~/agent-channel/opencode/channel ~/.config/opencode/skills/channel
 
 ### Pi
 
-Reuses the OpenCode skill. Background wake needs the
-[`fl4p/pi-bash-background`](https://github.com/fl4p/pi-bash-background) extension
-(Pi ships no background-bash).
+Reuses the OpenCode skill.
 
 ```bash
 git clone https://github.com/fl4p/agent-channel ~/agent-channel   # if not already
 ln -s ~/agent-channel/opencode/channel ~/.pi/agent/skills/channel
+```
+
+Optional, for zero-token background wake (Pi ships no background-bash): also
+install the [`fl4p/pi-bash-background`](https://github.com/fl4p/pi-bash-background)
+extension. Without it, messaging still works — fall back to foreground `listen`.
+
+```bash
 git clone https://github.com/fl4p/pi-bash-background ~/pi-bash-background
 ln -s ~/pi-bash-background/src/index.ts ~/.pi/agent/extensions/bash-background.ts
 ```
