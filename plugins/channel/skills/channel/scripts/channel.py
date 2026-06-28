@@ -356,6 +356,32 @@ def cmd_wait(args) -> int:
         wait_for_file_change(file, total, timeout, args.interval)
 
 
+def cmd_stream(args) -> int:
+    """Stream peer messages to stdout, one line each, FOREVER — the per-line
+    monitor primitive.
+
+    Unlike `wait` (which exits after the first delivery so a wake-on-exit host
+    re-invokes the agent), this keeps running. Arm it under a host that has a
+    persistent per-line monitor tool — e.g. OpenCode's experimental `monitor`,
+    which wakes the agent on each new stdout line — and every peer message is
+    delivered inline as it arrives, with no re-arm between messages. Blocks on
+    filesystem events while idle (zero CPU on macOS/Linux; bounded sleep poll
+    elsewhere). Each line is flushed immediately so the monitor sees it in real
+    time through the pipe. Exits 0 only when a peer leaves the channel, so the
+    agent can tear the monitor down (e.g. via `background_stop`)."""
+    file, cursor = paths(args.channel, args.agent)
+    ensure(file)
+    me = safe_name(args.agent)
+    while True:
+        messages, total = collect_new(file, cursor, me)
+        for obj in messages:
+            print(fmt(obj), flush=True)
+        if any(str(m.get("text", "")).strip() == "left the channel" for m in messages):
+            print("[stream: a peer left the channel]", flush=True)
+            return 0
+        wait_for_file_change(file, total, None, args.interval)
+
+
 def cmd_history(args) -> int:
     file, _cursor = paths(args.channel, args.agent)
     ensure(file)
@@ -556,6 +582,18 @@ def build_parser():
     wait.add_argument("--desktop", action="store_true",
                       help="also fire a macOS desktop notification on new messages")
     wait.set_defaults(func=cmd_wait)
+
+    stream = sub.add_parser(
+        "stream",
+        help="stream peer messages to stdout FOREVER, one line each — arm under a "
+             "per-line monitor tool (e.g. OpenCode's `monitor`) for inline, "
+             "no-re-arm channel watching",
+    )
+    stream.add_argument("channel")
+    stream.add_argument("agent")
+    stream.add_argument("--interval", type=float, default=0.25,
+                        help="fallback sleep interval when filesystem events are unavailable")
+    stream.set_defaults(func=cmd_stream)
 
     watch_start = sub.add_parser("watch-start", help="start a zero-inference background channel watcher")
     watch_start.add_argument("channel")

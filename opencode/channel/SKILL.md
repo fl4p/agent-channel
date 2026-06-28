@@ -18,14 +18,19 @@ implementation details for the agent to execute.
 
 Agents are turn-based. Do not start a background watcher and expect its output to enter context unless the host explicitly has a persistent monitor tool that feeds output back into the conversation. The receive primitive is `listen` or `wait`: on macOS these block on filesystem events with `kqueue`, so they wake when the channel file changes instead of polling on a fixed sleep. On platforms without a stdlib filesystem watcher, the helper falls back to a short bounded sleep interval.
 
-> **OpenCode: use foreground `listen`, not background `wait`.** The zero-token
-> background `wait` relies on the harness re-invoking the agent when a
-> *background* command exits — "background injection", which upstream OpenCode
-> does not support yet. An open PR adds it (a Monitor tool that wakes the agent
-> on background-watcher output): <https://github.com/anomalyco/opencode/pull/33806>.
-> Until it merges, drive the channel with foreground `listen --timeout 30` and
-> re-run it while waiting. `wait` still works if you launch it, but OpenCode won't
-> wake you on its exit, so it only helps when you actively block on it in the turn.
+> **OpenCode: watch with a background tool if you have one, else foreground `listen`.**
+> Background watching needs the harness to feed watcher output back into context;
+> OpenCode does this via experimental tools (PR
+> <https://github.com/anomalyco/opencode/pull/33806>). In preference order:
+>
+> - **`monitor`** — arm `python3 <HELPER> stream <channel> <agent>`. `stream` prints
+>   one line per message and never exits, so `monitor` wakes you inline on each
+>   message, no re-arm. `background_stop` to stop (it also self-exits on peer leave).
+> - **`bash_background`** — wake-on-exit, like Claude's `run_in_background`. Arm
+>   `python3 <HELPER> wait <channel> <agent> --timeout 0`; it wakes you when `wait`
+>   exits on the next message (read its logfile), then re-arm. `background_stop` to stop.
+> - **neither** (stock OpenCode) — foreground `listen --timeout 30`, re-run while
+>   waiting. `wait` runs but OpenCode won't wake you on its exit.
 
 While joined to a live channel, treat listening as active work. Use an explicit bounded timeout such as `--timeout 30` so the command returns cleanly in turn-based harnesses. Do not stop after one empty poll if the user is waiting for the peer; run another `listen --timeout 30` call unless the user asks you to stop, the peer leaves, or the channel task is clearly complete.
 
@@ -82,6 +87,11 @@ python3 <HELPER> listen <channel> <agent> --timeout 30
 # the harness re-invokes the agent after background command completion.
 python3 <HELPER> wait <channel> <agent>
 
+# Stream peer messages to stdout FOREVER, one line each (never exits until a peer
+# leaves). Arm this under a per-line monitor tool (OpenCode's `monitor`) so each
+# message wakes you inline with no re-arm. See the OpenCode note above.
+python3 <HELPER> stream <channel> <agent>
+
 # Start a zero-inference watcher in the background. It writes a watch log and,
 # on macOS, posts desktop notifications for peer messages without advancing the
 # normal poll/listen cursor.
@@ -119,7 +129,9 @@ When joining a channel:
 2. Run `setup`.
 3. Send `hello`.
 4. Run `history` once and summarize any existing peer messages.
-5. Run one foreground `listen`.
+5. Start watching (see the OpenCode note above): `monitor`+`stream` (end the turn;
+   wakes inline; `background_stop` when done), else `bash_background`+`wait --timeout 0`
+   (end the turn; re-arm after each wake), else one foreground `listen`, turn by turn.
 6. Continue turn by turn:
    - When the user gives a message, send it and listen again.
    - When `listen` returns peer messages, show them to the user and respond as requested.
