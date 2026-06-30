@@ -279,23 +279,27 @@ def wait_for_file_change(file: Path, observed_total: int, timeout, fallback_inte
 
     if hasattr(select, "kqueue") and hasattr(select, "kevent"):
         fd = os.open(file, os.O_RDONLY)
-        kq = select.kqueue()
         try:
-            flags = select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR
-            fflags = (
-                select.KQ_NOTE_WRITE
-                | select.KQ_NOTE_EXTEND
-                | select.KQ_NOTE_DELETE
-                | select.KQ_NOTE_RENAME
-            )
-            event = select.kevent(fd, filter=select.KQ_FILTER_VNODE, flags=flags, fflags=fflags)
-            kq.control([event], 0, 0)
-            if line_count(file) != observed_total:
-                return True
-            events = kq.control(None, 1, timeout)
-            return bool(events)
+            # Open kqueue inside the try so fd is closed even if kqueue() raises
+            # (e.g. EMFILE under fd pressure); otherwise the stream loop leaks fds.
+            kq = select.kqueue()
+            try:
+                flags = select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR
+                fflags = (
+                    select.KQ_NOTE_WRITE
+                    | select.KQ_NOTE_EXTEND
+                    | select.KQ_NOTE_DELETE
+                    | select.KQ_NOTE_RENAME
+                )
+                event = select.kevent(fd, filter=select.KQ_FILTER_VNODE, flags=flags, fflags=fflags)
+                kq.control([event], 0, 0)
+                if line_count(file) != observed_total:
+                    return True
+                events = kq.control(None, 1, timeout)
+                return bool(events)
+            finally:
+                kq.close()
         finally:
-            kq.close()
             os.close(fd)
 
     if sys.platform.startswith("linux"):

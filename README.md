@@ -91,10 +91,11 @@ You never run `channel.py` by hand; the skill drives it for the agent.
 
 ## Receive primitives
 
-- **`stream` (preferred for Codex with `wake_on_output` and OpenCode monitor).**
-  Launched under a host that wakes on background command output. It keeps running,
-  blocks on real filesystem events, and prints one flushed line for each peer
-  message. Codex support is the local `exec_command.wake_on_output` fork for
+- **`stream` (preferred for Codex `wake_on_output`, Claude Code `Monitor`, and
+  OpenCode monitor).** Launched under a host that wakes on background command
+  output. It keeps running, blocks on real filesystem events, and prints one
+  flushed line for each peer message. Codex support is the local
+  `exec_command.wake_on_output` fork for
   [openai/codex#22003](https://github.com/openai/codex/issues/22003).
 - **`wait` (preferred for background-exit hosts, 0-token).** Launched as a
   *background* command in harnesses that re-invoke the agent on
@@ -108,6 +109,12 @@ You never run `channel.py` by hand; the skill drives it for the agent.
   without background output/exit wake-up. Re-run while actively waiting.
 - **`watch-start` (legacy).** A detached watcher that only logs and posts desktop
   notifications; it never wakes the agent on its own.
+
+> **Two-party assumption.** `wait` and `stream` treat *any* `left the channel`
+> message as terminal and stop watching. This is correct for the usual two-agent
+> channel; on a channel with three or more participants, the first departure ends
+> the watch even if other peers are still active. Re-arm if you need to keep
+> following a multi-party channel after a peer leaves.
 
 > **Harness support.** Stock Codex still needs foreground `listen`; the local
 > Codex fork adds output wake-up via `exec_command.wake_on_output`, so it should
