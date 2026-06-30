@@ -163,10 +163,27 @@ def cmd_setup(args) -> int:
 
 
 def cmd_send(args) -> int:
-    file, _cursor = paths(args.channel, args.agent)
+    file, cursor = paths(args.channel, args.agent)
     ensure(file)
+    me = safe_name(args.agent)
+    # Show unread peer messages BEFORE sending so the caller sees anything that
+    # arrived while it was working — prevents message-crossing where both sides
+    # talk past each other. Display-only: this does NOT advance the shared
+    # cursor, so a concurrently-armed poll/listen/wait still delivers every line
+    # to its own stdout. Our freshly appended line needs no cursor bump either —
+    # the next read filters it out via the from != me check.
+    missed = []
+    for _lineno, line in iter_lines_after(file, read_cursor(cursor)):
+        obj = parse_line(line)
+        if obj and obj.get("from") != me:
+            missed.append(obj)
+    if missed:
+        print(f"[drain: {len(missed)} unread message(s)]")
+        for obj in missed:
+            print(fmt(obj))
+        print("[end drain]")
     text = " ".join(args.text).replace("\r", " ").replace("\n", " ")
-    record = {"from": safe_name(args.agent), "ts": int(time.time()), "text": text}
+    record = {"from": me, "ts": int(time.time()), "text": text}
     with file.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
     print(f"sent: {text}")
