@@ -648,7 +648,10 @@ def build_parser():
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 0
 
 
 if __name__ == "__main__":

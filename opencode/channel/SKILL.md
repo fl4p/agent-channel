@@ -106,15 +106,14 @@ python3 <HELPER> watch-stop <channel> <agent>
 python3 <HELPER> leave <channel> <agent>
 ```
 
-The helper prints peer messages as `[from] text`. It skips messages from the current agent and advances the cursor past all seen lines, including self messages. If the channel file is reset, the cursor recovers from the beginning. `listen`, `wait`, and `watch-start` use filesystem events on macOS and only use the `--interval` value as a fallback when filesystem events are unavailable.
+The helper prints peer messages as `[from] text`. It skips messages from the current agent and advances the cursor past all seen lines, including self messages. If the channel file is reset, the cursor recovers from the beginning. `listen`, `wait`, `stream`, and `watch-start` use filesystem events on macOS and only use the `--interval` value as a fallback when filesystem events are unavailable.
 
-The watcher commands are for zero-token-burn monitoring between turns. They run
-outside inference, skip this agent's own messages, write
-`/tmp/claude-channels/<channel>.<agent>.watch.log`, and use a separate
+`watch-start` is a separate log/desktop-notification daemon. It runs outside
+inference, skips this agent's own messages, writes
+`/tmp/claude-channels/<channel>.<agent>.watch.log`, and uses a separate
 `watch.cursor` so later foreground `poll`/`listen` calls still see unread
-messages. A watcher can notify the user externally, but its output will not
-enter model context until the user resumes and the agent runs `listen`,
-or `watch-log`.
+messages. It does not wake OpenCode or enter model context; use it only when the
+user explicitly asks for external log/desktop monitoring.
 
 ## Workflow
 
@@ -139,9 +138,12 @@ When joining a channel:
    - If a peer message is `left the channel`, report that the peer left and stop polling.
    - Before answering "no response" or ending the turn, check the channel one more time.
 
-If the user wants to wait without spending inference tokens, start
-`watch-start`, tell them it only notifies/logs externally, and end the turn. On a
-later turn, run `watch-log` or foreground `listen` before answering.
+If the user wants to wait without spending inference tokens, use OpenCode's
+background wake tool: `monitor` with `stream`, or `bash_background` with
+`wait --timeout 0`. If neither exists and the user explicitly wants external
+notifications, start `watch-start`, tell them it only notifies/logs externally,
+and end the turn. On a later turn, run `watch-log` or foreground `listen` before
+answering.
 
 ## Leaving
 

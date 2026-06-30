@@ -16,17 +16,33 @@ implementation details for the agent to execute.
 
 ## Important Model
 
-Agents are turn-based. Do not start a background watcher and expect its output to enter context unless the host explicitly has a persistent monitor tool that feeds output back into the conversation. The receive primitive is `listen` or `wait`: on macOS these block on filesystem events with `kqueue`, so they wake when the channel file changes instead of polling on a fixed sleep. On platforms without a stdlib filesystem watcher, the helper falls back to a short bounded sleep interval.
+Agents are turn-based. A channel watcher only enters context while the agent is idle if the host can wake the agent from background command output.
 
-> **Codex: use foreground `listen`, not background `wait`.** The zero-token
-> background `wait` relies on the harness re-invoking the agent when a
-> *background* command exits — "background injection", which Codex does not
-> support yet (tracking: <https://github.com/openai/codex/issues/22003>). Until
-> that lands, drive the channel with foreground `listen --timeout 30` and re-run
-> it while waiting. `wait` still works if you launch it, but Codex won't wake you
-> on its exit, so it only helps when you actively block on it in the turn.
+> **Codex with `exec_command.wake_on_output`: use `stream`.** This is the local
+> fork path for <https://github.com/openai/codex/issues/22003>. The tool may be
+> shown as `exec_command` or namespaced like `functions.exec_command`; the
+> `wake_on_output` parameter is decisive. Launch `python3 <HELPER> stream
+> <channel> <agent>` with `wake_on_output: true`, `tty: true`, and a short
+> `yield_time_ms`. `stream` prints one flushed line per peer message and keeps
+> running, so Codex is re-entered by synthetic
+> background-output user messages. No re-arm is needed. Do not also run
+> foreground `poll`/`listen`/`wait` while `stream` is live because they share the
+> same cursor. Keep the returned `session_id`; stop it with `write_stdin` Ctrl-C
+> (`"\u0003"`) if the user leaves before the stream exits.
+>
+> **Stock Codex: use foreground `listen`, not background `wait`.** If the
+> `wake_on_output` parameter is absent, Codex cannot receive asynchronous
+> channel updates while idle. Drive the channel with foreground
+> `listen --timeout 30` and re-run it while waiting. `wait` still works if you
+> actively block on it in the turn, but launching it in the background will not
+> wake Codex.
 
-While joined to a live channel, treat listening as active work. Use an explicit bounded timeout such as `--timeout 30` so the command returns cleanly in turn-based harnesses. Do not stop after one empty poll if the user is waiting for the peer; run another `listen --timeout 30` call unless the user asks you to stop, the peer leaves, or the channel task is clearly complete.
+Do **not** use `watch-start` for a normal "watch in the background" request.
+`watch-start` is log/desktop-notification only and does not put messages into
+Codex context. Use it only if the user explicitly asks for desktop/log-only
+monitoring or accepts that Codex will not be re-entered.
+
+While joined to a live channel without an armed stream, treat listening as active work. Use an explicit bounded timeout such as `--timeout 30` so the command returns cleanly in turn-based harnesses. Do not stop after one empty poll if the user is waiting for the peer; run another `listen --timeout 30` call unless the user asks you to stop, the peer leaves, or the channel task is clearly complete.
 
 Shell variables do not persist between tool calls in many agent harnesses. Resolve the channel name and your agent name once, tell the user which name you adopted, then pass those literal values to every helper command.
 
@@ -75,6 +91,10 @@ python3 <HELPER> listen <channel> <agent> --timeout 30
 # the harness re-invokes the agent after background command completion.
 python3 <HELPER> wait <channel> <agent>
 
+# Stream peer messages forever, one line per message. Use with Codex
+# exec_command wake_on_output.
+python3 <HELPER> stream <channel> <agent>
+
 # Start a zero-inference watcher in the background. It writes a watch log and,
 # on macOS, posts desktop notifications for peer messages without advancing the
 # normal poll/listen cursor.
@@ -89,15 +109,18 @@ python3 <HELPER> watch-stop <channel> <agent>
 python3 <HELPER> leave <channel> <agent>
 ```
 
-The helper prints peer messages as `[from] text`. It skips messages from the current agent and advances the cursor past all seen lines, including self messages. If the channel file is reset, the cursor recovers from the beginning. `listen`, `wait`, and `watch-start` use filesystem events on macOS and only use the `--interval` value as a fallback when filesystem events are unavailable.
+The helper prints peer messages as `[from] text`. It skips messages from the current agent and advances the cursor past all seen lines, including self messages. If the channel file is reset, the cursor recovers from the beginning. `listen`, `wait`, `stream`, and `watch-start` use filesystem events on macOS and only use the `--interval` value as a fallback when filesystem events are unavailable.
 
-The watcher commands are for zero-token-burn monitoring between turns. They run
-outside inference, skip this agent's own messages, write
-`/tmp/claude-channels/<channel>.<agent>.watch.log`, and use a separate
+`stream` is the Codex output-wake path when `wake_on_output` exists. It shares
+the same cursor as `poll`/`listen`/`wait`, so do not use foreground receives
+while it is live.
+
+`watch-start` is a separate log/desktop-notification daemon. It runs outside
+inference, skips this agent's own messages, writes
+`/tmp/claude-channels/<channel>.<agent>.watch.log`, and uses a separate
 `watch.cursor` so later foreground `poll`/`listen` calls still see unread
-messages. A watcher can notify the user externally, but its output will not
-enter model context until the user resumes and the agent runs `listen`,
-or `watch-log`.
+messages. It does not wake Codex or enter model context; use it only when the
+user explicitly asks for external log/desktop monitoring.
 
 ## Workflow
 
@@ -112,17 +135,25 @@ When joining a channel:
 2. Run `setup`.
 3. Send `hello`.
 4. Run `history` once and summarize any existing peer messages.
-5. Run one foreground `listen`.
+5. If `exec_command.wake_on_output` is available, start `stream` with
+   `wake_on_output: true`, record the returned `session_id`, and end the turn.
+   Otherwise run foreground `listen --timeout 30`; do not substitute
+   `watch-start` unless explicitly requested as log-only monitoring.
 6. Continue turn by turn:
-   - When the user gives a message, send it and listen again.
-   - When `listen` returns peer messages, show them to the user and respond as requested.
+   - When a Codex background-output wake arrives from `stream`, show the peer
+     messages from `Output:` and respond as requested. The stream stays armed;
+     do not re-arm it.
+   - When the user gives a message, send it. If `stream` is armed, end the turn
+     after sending; otherwise listen again.
+   - When foreground `listen` returns peer messages, show them to the user and respond as requested.
    - When `listen` times out and the user is waiting for the peer, run `listen` again.
    - If a peer message is `left the channel`, report that the peer left and stop polling.
    - Before answering "no response" or ending the turn, check the channel one more time.
 
-If the user wants to wait without spending inference tokens, start
-`watch-start`, tell them it only notifies/logs externally, and end the turn. On a
-later turn, run `watch-log` or foreground `listen` before answering.
+If the user explicitly asks for desktop/log-only monitoring and
+`wake_on_output` is unavailable, start `watch-start`, tell them it only
+notifies/logs externally, and end the turn. On a later turn, run `watch-log` or
+foreground `listen` before answering.
 
 ## Leaving
 

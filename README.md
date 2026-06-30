@@ -91,26 +91,30 @@ You never run `channel.py` by hand; the skill drives it for the agent.
 
 ## Receive primitives
 
-- **`wait` (preferred, 0-token).** Launched as a *background* command in harnesses
-  that re-invoke the agent on background-command exit (Claude Code). It blocks on
-  real filesystem events until a peer message lands, prints it, exits — waking the
-  agent exactly once with **zero idle CPU**: `kqueue` on macOS/BSD, `inotify` on
-  Linux (glibc *and* musl/Alpine). Windows, and any host where neither watcher can
-  be set up, fall back to a short bounded sleep poll — same behavior, just a little
-  idle CPU instead of true event blocking.
+- **`stream` (preferred for Codex with `wake_on_output` and OpenCode monitor).**
+  Launched under a host that wakes on background command output. It keeps running,
+  blocks on real filesystem events, and prints one flushed line for each peer
+  message. Codex support is the local `exec_command.wake_on_output` fork for
+  [openai/codex#22003](https://github.com/openai/codex/issues/22003).
+- **`wait` (preferred for background-exit hosts, 0-token).** Launched as a
+  *background* command in harnesses that re-invoke the agent on
+  background-command exit (Claude Code). It blocks on real filesystem events
+  until a peer message lands, prints it, exits — waking the agent exactly once
+  with **zero idle CPU**: `kqueue` on macOS/BSD, `inotify` on Linux (glibc *and*
+  musl/Alpine). Windows, and any host where neither watcher can be set up, fall
+  back to a short bounded sleep poll — same behavior, just a little idle CPU
+  instead of true event blocking.
 - **`listen --timeout 30` (portable).** Foreground bounded listen for harnesses
-  without background wake-up. Re-run while actively waiting.
+  without background output/exit wake-up. Re-run while actively waiting.
 - **`watch-start` (legacy).** A detached watcher that only logs and posts desktop
   notifications; it never wakes the agent on its own.
 
-> **Harness support for background `wait`.** The zero-token background `wait`
-> needs the harness to re-invoke the agent when a background command exits
-> ("background injection"). **Claude Code** supports this today. **Codex** does
-> not yet ([openai/codex#22003](https://github.com/openai/codex/issues/22003)),
-> and **upstream OpenCode** does not yet — open PR
-> [anomalyco/opencode#33806](https://github.com/anomalyco/opencode/pull/33806)
-> adds it (a Monitor background-watcher tool). On those, use foreground `listen`
-> until support lands. (Messaging itself works everywhere regardless.)
+> **Harness support.** Stock Codex still needs foreground `listen`; the local
+> Codex fork adds output wake-up via `exec_command.wake_on_output`, so it should
+> use `stream`, not background `wait`. Claude Code supports background-exit
+> `wait`. Upstream OpenCode needs monitor/background tooling; the local fork and
+> PR [anomalyco/opencode#33806](https://github.com/anomalyco/opencode/pull/33806)
+> add that path. Messaging itself works everywhere regardless.
 
 ## Protocol
 
