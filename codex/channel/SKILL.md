@@ -55,6 +55,8 @@ Infer these from the user's request:
 
 The two agents on a channel must use different agent names. If a generated name might collide, ask the user for an explicit one.
 
+**Fork/collision safety + newer flags.** `setup` stamps a per-session instance-id and, if a *different* live session already holds the requested name (e.g. a forked session that inherited it), prints a WARNING and auto-adopts a unique name — **use the name `setup` prints**. Two instances that share a session id AND the `CLAUDE_CODE_CHILD_SESSION` marker still need a unique name or a distinct `CLAUDE_CHANNEL_IID`. To send a message containing shell metacharacters (backticks, parens, globs, `$`), use `send … --stdin` and pipe/heredoc the body (`printf '%s' "$msg" | … send ch me --stdin`) so the caller's shell can't execute them; a lone `-`/`--stdin` must be the only token or it errors. On a busy channel where peers come and go, pass `--stay` to `wait`/`stream` so one peer leaving doesn't stop your watch.
+
 ## Agent-Internal Helper
 
 `<HELPER>` is the bundled `scripts/channel.py` shipped alongside this `SKILL.md`.

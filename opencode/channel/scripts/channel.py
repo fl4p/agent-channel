@@ -2,10 +2,12 @@
 import argparse
 import ctypes
 import ctypes.util
+import hashlib
 import json
 import os
 import platform
 import random
+import re
 import select
 import signal
 import subprocess
@@ -82,6 +84,85 @@ def write_cursor(cursor: Path, value: int):
     cursor.write_text(f"{value}\n")
 
 
+def instance_id() -> str:
+    """A per-instance identity so a session that shares an agent NAME with another
+    live instance is still distinguishable.
+
+    Priority:
+      1. CLAUDE_CHANNEL_IID — explicit, set this when nothing else disambiguates
+         (e.g. two sibling Task subagents, or any harness with no session id).
+      2. harness session id (Claude Code / Codex / OpenCode), FOLDED WITH the
+         CLAUDE_CODE_CHILD_SESSION marker — a Claude Code subagent/fork inherits the
+         PARENT's session id and is set apart only by that child marker, so a bare
+         session id would make a child look identical to its parent (verified).
+
+    Returns "" when nothing is available; callers then fall back to name-only
+    behaviour and the skill relies on unique names instead. NOTE: two instances that
+    share BOTH the session id AND the child marker (e.g. two sibling subagents) still
+    collide unless one sets CLAUDE_CHANNEL_IID — that is the documented escape hatch."""
+    explicit = os.environ.get("CLAUDE_CHANNEL_IID")
+    if explicit:
+        return safe_name(explicit)
+    base = ""
+    for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "OPENCODE_SESSION_ID"):
+        val = os.environ.get(key)
+        if val:
+            base = val
+            break
+    if not base:
+        return ""
+    child = os.environ.get("CLAUDE_CODE_CHILD_SESSION")
+    if child:                       # subagent/fork shares parent session id -> fold in
+        base = f"{base}.c{child}"
+    return safe_name(base)
+
+
+def _id_suffix(iid: str) -> str:
+    """A stable 6-hex suffix derived from an instance-id — 16M buckets, so two
+    distinct ids collide far less often than a raw last-4-chars slice would."""
+    return hashlib.sha1(iid.encode("utf-8", "replace")).hexdigest()[:6]
+
+
+def is_own(obj: dict, me: str, my_iid: str) -> bool:
+    """Whether `obj` was sent by THIS instance (filtered out on receive).
+
+    Own = same sender name AND (no instance-id on the record, or no id for us, or the
+    ids match). A same-name message carrying a DIFFERENT instance-id — i.e. a forked
+    session posting under the inherited name — is NOT own, so it is delivered instead
+    of being silently swallowed by the `from == me` echo filter (the collision bug)."""
+    if obj.get("from") != me:
+        return False
+    riid = obj.get("iid")
+    return (not riid) or (not my_iid) or (riid == my_iid)
+
+
+def owner_file(channel: str, agent: str) -> Path:
+    return ROOT / f"{safe_name(channel)}.{safe_name(agent)}.owner"
+
+
+def last_activity(file: Path, name: str):
+    """(newest_ts_from_name, left_flag). left_flag True if its last line was a leave."""
+    last_ts, left = None, False
+    for _lineno, line in iter_lines_after(file, 0):
+        obj = parse_line(line)
+        if not obj or obj.get("from") != name:
+            continue
+        last_ts = obj.get("ts", last_ts)
+        left = str(obj.get("text", "")).strip() == "left the channel"
+    return last_ts, left
+
+
+def name_recently_active(file: Path, name: str, window: int = 7200) -> bool:
+    """Has `name` posted (without a trailing leave) within `window` seconds?"""
+    last_ts, left = last_activity(file, name)
+    if last_ts is None or left:
+        return False
+    try:
+        return (int(time.time()) - int(last_ts)) <= window
+    except Exception:
+        return True
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -155,10 +236,39 @@ def notify_desktop(title: str, message: str):
 
 
 def cmd_setup(args) -> int:
-    file, cursor = paths(args.channel, args.agent)
+    ch = safe_name(args.channel)
+    name = safe_name(args.agent)
+    file, cursor = paths(args.channel, name)
     ensure(file)
+    iid = instance_id()
+    of = owner_file(args.channel, name)
+    owner = of.read_text().strip() if of.exists() else ""
+
+    # Auto-rename only when we can PROVE a different live instance holds this name:
+    # a recorded owner-id that differs from ours AND recent traffic under the name.
+    # Without an iid we cannot tell "me re-joining" from "someone else", so we do NOT
+    # guess — the skill instructions rely on unique names (and CLAUDE_CHANNEL_IID) for
+    # that case instead of a heuristic that both mis-fires and misses.
+    collision = bool(iid and owner and owner != iid and name_recently_active(file, name))
+    if collision:
+        requested = name
+        tok = _id_suffix(iid)
+        # strip any prior `-<6hex>` suffix so repeated renames (e.g. a restarting session)
+        # don't compound into name-a1b2c3-d4e5f6-… ; always base off the original stem.
+        base = re.sub(r"-[0-9a-f]{6}$", "", args.agent)
+        name = safe_name(f"{base}-{tok}")
+        file, cursor = paths(args.channel, name)
+        of = owner_file(args.channel, name)
+        print(f"WARNING: agent name '{requested}' is already ACTIVE on channel '{ch}' "
+              f"from another session (e.g. a forked session sharing the inherited "
+              f"name). Two agents under one name go SILENTLY BLIND to each other's "
+              f"messages, so adopting a unique name instead.")
+        print(f"IMPORTANT: use agent name '{name}' for ALL further channel commands "
+              f"(send/history/wait/stream/leave), NOT '{requested}'.")
+    if iid:
+        of.write_text(iid + "\n")
     write_cursor(cursor, line_count(file))
-    print(f"channel={safe_name(args.channel)} agent={safe_name(args.agent)} file={file} cursor={cursor}")
+    print(f"channel={ch} agent={name} file={file} cursor={cursor}")
     return 0
 
 
@@ -166,24 +276,86 @@ def cmd_send(args) -> int:
     file, cursor = paths(args.channel, args.agent)
     ensure(file)
     me = safe_name(args.agent)
+    my_iid = instance_id()
     # Show unread peer messages BEFORE sending so the caller sees anything that
     # arrived while it was working — prevents message-crossing where both sides
     # talk past each other. Display-only: this does NOT advance the shared
     # cursor, so a concurrently-armed poll/listen/wait still delivers every line
     # to its own stdout. Our freshly appended line needs no cursor bump either —
-    # the next read filters it out via the from != me check.
+    # the next read filters it out via is_own.
     missed = []
     for _lineno, line in iter_lines_after(file, read_cursor(cursor)):
         obj = parse_line(line)
-        if obj and obj.get("from") != me:
+        if obj and not is_own(obj, me, my_iid):
             missed.append(obj)
     if missed:
         print(f"[drain: {len(missed)} unread message(s)]")
         for obj in missed:
             print(fmt(obj))
         print("[end drain]")
-    text = " ".join(args.text).replace("\r", " ").replace("\n", " ")
+    # Read the body from stdin so shell metacharacters (backticks, parens, globs, `$`)
+    # in the message never reach the CALLER's shell as command arguments — the caller
+    # pipes/heredocs the text instead of interpolating it into an arg. Triggered by the
+    # `--stdin` flag OR a `-`/`--stdin` token used as the SOLE message token (`text` is
+    # argparse.REMAINDER, which greedily swallows `--stdin` after the positionals, so the
+    # flag also has to be recognised there). Anything ambiguous is REFUSED loudly rather
+    # than silently corrupting the message or dropping the piped body.
+    SENTINELS = ("-", "--stdin")
+    body = list(args.text or [])
+    # stdin mode when: the --stdin flag was parsed (only possible before the REMAINDER),
+    # OR the SOLE message token is a `-`/`--stdin` sentinel (the flag-after-positionals
+    # form, since REMAINDER swallows the flag into `text`). A `-`/`--stdin` appearing AMONG
+    # other words is ordinary literal text (a dash, a range "3 - 5", a bullet) and is left
+    # alone — NOT treated as a sentinel and NOT an error.
+    stdin_mode = bool(getattr(args, "stdin", False)) or (len(body) == 1 and body[0] in SENTINELS)
+    if not stdin_mode and "--stdin" in body:
+        # `--stdin` among other words is almost never literal text (unlike a bare `-`) —
+        # it's a caller that typed the flag after the positionals but forgot to pipe a
+        # body. Refuse loudly instead of sending a message with a stray "--stdin" glued in.
+        print("error: '--stdin' among positional text is ambiguous (did you mean to pipe "
+              "the body?). Use --stdin with piped/heredoc input, or remove the token.",
+              file=sys.stderr)
+        return 2
+    if stdin_mode:
+        leftover = [t for t in body if t not in SENTINELS]
+        if leftover:                    # explicit --stdin flag AND positional text
+            print("error: --stdin was given together with positional text; pass the body "
+                  "via stdin only.", file=sys.stderr)
+            return 2
+        if sys.stdin.isatty():          # interactive terminal -> nothing piped; fail fast
+            print("error: --stdin but stdin is a TTY (nothing piped). Pipe or heredoc the "
+                  "body, e.g.  printf '%s' \"$msg\" | ... send ch agent --stdin",
+                  file=sys.stderr)
+            return 2
+        try:                            # backstop: a held-open but silent stdin (not a tty)
+            ready, _, _ = select.select([sys.stdin], [], [], 10.0)  # would hang read()
+            if not ready:
+                print("error: --stdin but no input arrived within 10s (nothing piped, or "
+                      "stdin held open with no data). Aborting instead of hanging.",
+                      file=sys.stderr)
+                return 2
+        except (OSError, ValueError):   # select unsupported for this fd/platform (e.g.
+            pass                        # Windows pipes); isatty already handled the tty case
+        # Collapse newlines (like the positional path) so ONE message stays ONE physical
+        # line: stream/watch-run and per-line monitors rely on one event per message, and
+        # a JSON-embedded newline would fan a message into multiple unattributed lines.
+        text = sys.stdin.read().replace("\r", " ").replace("\n", " ").strip()
+    else:
+        text = " ".join(body).replace("\r", " ").replace("\n", " ").strip()
+    if not text:                        # no empty messages from EITHER path (closed/EOF
+        print("error: empty message (nothing to send).", file=sys.stderr)  # stdin, or a
+        return 2                        # bare `send ch agent` with no text tokens)
     record = {"from": me, "ts": int(time.time()), "text": text}
+    if my_iid:
+        record["iid"] = my_iid
+    # If this name is owned by a different live instance, warn on stderr — a forked
+    # session that never re-ran setup lands here, and this tells it to rename.
+    of = owner_file(args.channel, args.agent)
+    owner = of.read_text().strip() if of.exists() else ""
+    if my_iid and owner and owner != my_iid and name_recently_active(file, me):
+        print(f"WARNING: '{me}' is also active from another session (instance {owner[:8]} "
+              f"vs yours {my_iid[:8]}). Re-run `setup` to adopt a unique name, or your "
+              f"messages will be indistinguishable on the channel.", file=sys.stderr)
     with file.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
     print(f"sent: {text}")
@@ -195,10 +367,11 @@ def collect_new(file: Path, cursor: Path, me: str):
     last = read_cursor(cursor)
     if total < last:
         last = 0
+    my_iid = instance_id()
     messages = []
     for _lineno, line in iter_lines_after(file, last):
         obj = parse_line(line)
-        if obj and obj.get("from") != me:
+        if obj and not is_own(obj, me, my_iid):
             messages.append(obj)
     write_cursor(cursor, total)
     return messages, total
@@ -365,9 +538,13 @@ def cmd_wait(args) -> int:
             print(f"[wait: {len(messages)} new message(s); cursor={total}]")
             if args.desktop:
                 notify_desktop(f"{safe_name(args.channel)} channel", fmt(messages[-1]))
-            # A peer 'left the channel' is terminal — surface it so the agent
-            # stops re-arming the watcher.
-            if any(str(m.get("text", "")).strip() == "left the channel" for m in messages):
+            # A peer 'left the channel' is normally terminal — surface it so the agent
+            # stops re-arming. With --stay, keep watching through OTHER peers leaving
+            # (busy multi-agent channels where peers come and go): deliver the leave
+            # message but suppress the terminal marker, so the agent re-arms as usual.
+            if (not getattr(args, "stay", False)
+                    and any(str(m.get("text", "")).strip() == "left the channel"
+                            for m in messages)):
                 print("[wait: a peer left the channel]")
             return 0
         if deadline is not None and time.time() >= deadline:
@@ -397,7 +574,12 @@ def cmd_stream(args) -> int:
         messages, total = collect_new(file, cursor, me)
         for obj in messages:
             print(fmt(obj), flush=True)
-        if any(str(m.get("text", "")).strip() == "left the channel" for m in messages):
+        # Exit when a peer leaves so the host can tear the monitor down — UNLESS --stay,
+        # which keeps streaming through other peers' leaves (busy channels). The leave
+        # message itself is still delivered above either way.
+        if (not getattr(args, "stay", False)
+                and any(str(m.get("text", "")).strip() == "left the channel"
+                        for m in messages)):
             print("[stream: a peer left the channel]", flush=True)
             return 0
         wait_for_file_change(file, total, None, args.interval)
@@ -407,10 +589,11 @@ def cmd_history(args) -> int:
     file, _cursor = paths(args.channel, args.agent)
     ensure(file)
     me = safe_name(args.agent)
+    my_iid = instance_id()
     any_msg = False
     for _lineno, line in iter_lines_after(file, 0):
         obj = parse_line(line)
-        if obj and obj.get("from") != me:
+        if obj and not is_own(obj, me, my_iid):
             print(fmt(obj))
             any_msg = True
     if not any_msg:
@@ -419,13 +602,26 @@ def cmd_history(args) -> int:
 
 
 def cmd_leave(args) -> int:
+    file, cursor = paths(args.channel, args.agent)
+    my_iid = instance_id()
+    of = owner_file(args.channel, args.agent)
+    owner = of.read_text().strip() if of.exists() else ""
+    # Refuse to leave/unlink a name a DIFFERENT live instance owns. Otherwise leaving under
+    # a stale name (e.g. the pre-rename name after a collision) would delete the rightful
+    # owner's cursor + owner files AND inject a spurious 'left the channel' that trips the
+    # owner's own wait/stream terminal-leave logic. Destructive path -> hard refuse.
+    if my_iid and owner and owner != my_iid and name_recently_active(file, safe_name(args.agent)):
+        print(f"error: '{safe_name(args.agent)}' is owned by another live instance "
+              f"({owner[:8]}); refusing to leave/unlink it. Use your own (renamed) name.",
+              file=sys.stderr)
+        return 2
     send_args = argparse.Namespace(channel=args.channel, agent=args.agent, text=["left the channel"])
     rc = cmd_send(send_args)
-    _file, cursor = paths(args.channel, args.agent)
-    try:
-        cursor.unlink()
-    except FileNotFoundError:
-        pass
+    for extra in (cursor, of):
+        try:
+            extra.unlink()
+        except FileNotFoundError:
+            pass
     print(f"left channel={safe_name(args.channel)} agent={safe_name(args.agent)}")
     return rc
 
@@ -477,6 +673,7 @@ def cmd_watch_run(args) -> int:
     ensure(file)
     pid_file.write_text(f"{os.getpid()}\n")
     me = safe_name(args.agent)
+    my_iid = instance_id()
     try:
         while True:
             total = line_count(file)
@@ -486,7 +683,7 @@ def cmd_watch_run(args) -> int:
             lines = []
             for _lineno, line in iter_lines_after(file, last):
                 obj = parse_line(line)
-                if obj and obj.get("from") != me:
+                if obj and not is_own(obj, me, my_iid):
                     lines.append(fmt(obj))
             if lines:
                 with log_file.open("a", encoding="utf-8") as fh:
@@ -570,6 +767,10 @@ def build_parser():
     send = sub.add_parser("send")
     send.add_argument("channel")
     send.add_argument("agent")
+    send.add_argument("--stdin", action="store_true",
+                      help="read the message body from stdin instead of args, so shell "
+                           "metacharacters (backticks, parens, globs, $) can't be executed "
+                           "by the caller's shell — pipe or heredoc the text")
     send.add_argument("text", nargs=argparse.REMAINDER)
     send.set_defaults(func=cmd_send)
 
@@ -602,6 +803,9 @@ def build_parser():
                       help="fallback sleep interval when filesystem events are unavailable")
     wait.add_argument("--desktop", action="store_true",
                       help="also fire a macOS desktop notification on new messages")
+    wait.add_argument("--stay", action="store_true",
+                      help="keep watching when OTHER peers leave (busy multi-peer "
+                           "channels); default exits so the agent stops re-arming")
     wait.set_defaults(func=cmd_wait)
 
     stream = sub.add_parser(
@@ -614,6 +818,9 @@ def build_parser():
     stream.add_argument("agent")
     stream.add_argument("--interval", type=float, default=0.25,
                         help="fallback sleep interval when filesystem events are unavailable")
+    stream.add_argument("--stay", action="store_true",
+                        help="keep streaming when OTHER peers leave (busy multi-peer "
+                             "channels); default exits on any peer leave")
     stream.set_defaults(func=cmd_stream)
 
     watch_start = sub.add_parser("watch-start", help="start a zero-inference background channel watcher")
