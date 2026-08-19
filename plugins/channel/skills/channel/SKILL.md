@@ -18,11 +18,11 @@ implementation details for the agent to execute.
 
 Most agent harnesses are turn-based: they only see output returned by the current tool call. Watching a channel in the background needs the harness to wake you on output or exit. In preference order:
 
-1. **Codex with `exec_command.wake_on_output` — `stream` via output wake.** This is the local fork path for <https://github.com/openai/codex/issues/22003>. The tool may be shown as `exec_command` or namespaced like `functions.exec_command`; the `wake_on_output` parameter is decisive. Launch `python3 <HELPER> stream <channel> <agent>` with `wake_on_output: true`, `tty: true`, and a short `yield_time_ms`. It keeps running and prints one flushed line per peer message; Codex is re-entered by synthetic background-output user messages. No re-arm is needed. Do not also run foreground `poll`/`listen`/`wait` while the stream is live because they share the same cursor. Keep the returned `session_id`; stop it with `write_stdin` Ctrl-C (`"\u0003"`) if the user leaves before the stream exits.
+1. **Codex with `exec_command.wake_on_output` — `stream` via output wake.** This is the local fork path for <https://github.com/openai/codex/issues/22003>. The tool may be shown as `exec_command` or namespaced like `functions.exec_command`; the `wake_on_output` parameter is decisive. Launch `python3 <HELPER> stream <channel> <agent>` with `wake_on_output: true`, `tty: true`, and a short `yield_time_ms`. It keeps running and prints one flushed line per peer message; Codex is re-entered by synthetic background-output user messages. No re-arm is needed. Do not also run foreground `poll`/`listen`/`wait` while the stream is live because they share the same cursor. Keep the returned `session_id`. If the user stops watching without leaving, stop it with `write_stdin` Ctrl-C (`"\u0003"`). On `leave`, the helper requests stream shutdown before announcing departure; use Ctrl-C only if the host still reports it live.
 
 2. **Claude Code — `wait` via `Bash(run_in_background: true)`, or `stream` via `Monitor`.** Two output/exit-wake paths, both zero-token while idle (`kqueue`, no inference):
    - **`wait`** (default) blocks until a peer message lands, then exits — Claude Code re-invokes you with it. Handle it, re-launch `wait`. Shows as a background-job pill. Most robust under heavy traffic.
-   - **`stream` via the `Monitor` tool** (`Monitor` running `python3 <HELPER> stream <channel> <agent>`, `persistent: true`) wakes you inline on every message with **no re-arm** — Claude Code's `Monitor` is an output-line-wake tool, the same shape as OpenCode's `monitor`. Lower latency on rapid exchanges and saves the per-message re-arm call. `stream` self-exits when a peer leaves; stop early with `TaskStop`. Caveat: `Monitor` auto-stops a firehose, so prefer `wait` if the channel is very high-volume.
+   - **`stream` via the `Monitor` tool** (`Monitor` running `python3 <HELPER> stream <channel> <agent>`, `persistent: true`) wakes you inline on every message with **no re-arm** — Claude Code's `Monitor` is an output-line-wake tool, the same shape as OpenCode's `monitor`. Lower latency on rapid exchanges and saves the per-message re-arm call. Peer leaves are printed but do not stop the stream; stop early with `TaskStop`. Caveat: `Monitor` auto-stops a firehose, so prefer `wait` if the channel is very high-volume.
 
 3. **OpenCode or Pi with background tools — `monitor` / `bash_background`.** `monitor` running `python3 <HELPER> stream <channel> <agent>` wakes inline on every message, no re-arm. `bash_background` running `python3 <HELPER> wait <channel> <agent> --timeout 0` wakes once on exit; re-arm after each wake.
 
@@ -49,7 +49,7 @@ Recommended fallback names:
 
 Both agents must use different names. If a generated name might collide, ask the user for an explicit name.
 
-**Fork/collision safety + newer flags.** `setup` stamps a per-session instance-id and, if a *different* live session already holds the requested name (e.g. a forked session that inherited it), prints a WARNING and auto-adopts a unique name — **use the name `setup` prints**. Two instances that share a session id AND the `CLAUDE_CODE_CHILD_SESSION` marker still need a unique name or a distinct `CLAUDE_CHANNEL_IID`. To send a message containing shell metacharacters (backticks, parens, globs, `$`), use `send … --stdin` and pipe/heredoc the body (`printf '%s' "$msg" | … send ch me --stdin`) so the caller's shell can't execute them; a lone `-`/`--stdin` must be the only token or it errors. On a busy channel where peers come and go, pass `--stay` to `wait`/`stream` so one peer leaving doesn't stop your watch.
+**Fork/collision safety + newer flags.** `setup` stamps a per-session instance-id and, if a *different* live session already holds the requested name (e.g. a forked session that inherited it), prints a WARNING and auto-adopts a unique name — **use the name `setup` prints**. Two instances that share a session id AND the `CLAUDE_CODE_CHILD_SESSION` marker still need a unique name or a distinct `CLAUDE_CHANNEL_IID`. To send a message containing shell metacharacters (backticks, parens, globs, `$`), use `send … --stdin` and pipe/heredoc the body (`printf '%s' "$msg" | … send ch me --stdin`) so the caller's shell can't execute them; a lone `-`/`--stdin` must be the only token or it errors. On a busy channel where peers come and go, `stream` keeps watching through peer leaves by default; pass `--stay` to `wait` if one-shot wait should also keep watching after a leave.
 
 ## Agent-Internal Helper
 
@@ -72,6 +72,7 @@ Commands:
 python3 <HELPER> name
 python3 <HELPER> setup <channel> <agent>
 python3 <HELPER> send <channel> <agent> "hello"
+printf '%s' "$message" | python3 <HELPER> send <channel> <agent> --stdin
 python3 <HELPER> history <channel> <agent>
 python3 <HELPER> poll <channel> <agent> --timeout 30
 python3 <HELPER> listen <channel> <agent> --timeout 30
@@ -88,7 +89,10 @@ python3 <HELPER> leave <channel> <agent>
 
 `stream` is the persistent output-wake path for Codex `wake_on_output`, Claude Code's `Monitor`
 tool, and OpenCode/Pi `monitor`. It shares the SAME durable cursor as `poll`/`listen`/`wait`, so
-do not run foreground receives while a stream is live. It exits when a peer leaves the channel.
+do not run foreground receives while a stream is live. Peer leaves are printed but do not stop
+the stream; idle streams are blocked on filesystem events and cost no inference. Local `leave`
+requests every bundled stream under the same channel and agent name to exit before appending the
+departure event.
 
 `wait` is the **background-exit wake-up** path and shares the SAME durable cursor as
 `poll`/`listen` (so nothing is seen twice across modes). On macOS it uses
@@ -137,9 +141,9 @@ When joining:
      as requested, then re-arm `wait` if using background-exit mode.
    - With foreground `listen`, if it times out and the user is still waiting,
      run `listen` again; before answering "no response", check once more.
-   - If a peer message says `left the channel` (the `wait` output shows
-     `a peer left the channel`), report that the peer left and stop watching —
-     do not re-arm.
+   - If a peer message says `left the channel`, report that the peer left. Keep a
+     live `stream` armed only while channel work continues; if the task is
+     complete, leave the channel so the stream exits.
 
 To watch with zero token burn between turns, use the host's real wake mechanism:
 Codex `stream` with `wake_on_output`, OpenCode/Pi `monitor`/`stream`, or background
@@ -160,7 +164,12 @@ If running without the helper, preserve the same wire format and cursor semantic
 
 Treat these user messages as leave commands: `leave`, `leave the channel`, `exit`, `quit`, `stop watching`, `/leave`, `/exit`, `/quit`, `disconnect`, `close the channel`, `done`, `bye`, `goodbye`.
 
-On a leave command, run `leave`, report that you left, and stop polling.
+On a leave command, run `leave`, report that you left, and stop polling. The
+helper signals live bundled streams before appending the departure message and
+preserves the cursor. Never delete or reset the cursor while a receiver is live:
+that makes the receiver restart at position zero and replay the transcript. If
+the host still shows the stream afterward, stop it with the host's monitor/task
+control before reusing the same agent name.
 
 ## Protocol
 
@@ -181,6 +190,10 @@ Each agent cursor is:
 ```text
 /tmp/claude-channels/<channel>.<agent>.cursor
 ```
+
+`leave` preserves this cursor; the next `setup` resets it to the current channel
+end. This prevents a late-running receiver from treating a missing cursor as
+position zero.
 
 The cursor stores the last line number processed by that agent. Advance it past all seen lines, including self messages. If the channel file is reset and total lines are less than the cursor, restart from line 0.
 

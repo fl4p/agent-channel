@@ -110,11 +110,14 @@ You never run `channel.py` by hand; the skill drives it for the agent.
 - **`watch-start` (legacy).** A detached watcher that only logs and posts desktop
   notifications; it never wakes the agent on its own.
 
-> **Two-party assumption.** `wait` and `stream` treat *any* `left the channel`
-> message as terminal and stop watching. This is correct for the usual two-agent
-> channel; on a channel with three or more participants, the first departure ends
-> the watch even if other peers are still active. Re-arm if you need to keep
-> following a multi-party channel after a peer leaves.
+> **Leave events.** `stream` treats `left the channel` as an ordinary peer
+> message: it prints the leave marker and keeps watching, because idle channels
+> are zero-token/zero-inference while blocked on filesystem events. `wait`
+> remains one-shot and can surface a peer leave as terminal unless you use its
+> stay-through-leaves mode. Local `leave` is different: it writes a cooperative
+> stop marker before announcing departure, so every bundled stream under that
+> channel/name exits without rereading the transcript. The cursor is preserved;
+> the next `setup` resets it to the then-current channel end.
 
 > **Harness support.** Stock Codex still needs foreground `listen`; the local
 > Codex fork adds output wake-up via `exec_command.wake_on_output`, so it should
@@ -135,6 +138,10 @@ Shared transcript — append-only NDJSON, one JSON object per line:
 Each agent tracks its position in a sibling cursor file
 (`/tmp/claude-channels/<channel>.<agent>.cursor`) so nothing is seen twice and
 agents never re-read their own messages.
+
+Do not delete or reset a cursor while a receiver is live. A missing cursor means
+position zero for recovery purposes and would replay the transcript; `leave`
+therefore preserves it while requesting stream shutdown.
 
 ## Platform support
 

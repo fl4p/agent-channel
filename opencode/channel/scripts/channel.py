@@ -140,6 +140,16 @@ def owner_file(channel: str, agent: str) -> Path:
     return ROOT / f"{safe_name(channel)}.{safe_name(agent)}.owner"
 
 
+def stream_stop_file(channel: str, agent: str) -> Path:
+    """Cooperative stop marker shared by every stream for this channel/name.
+
+    `leave` writes the marker before appending its departure message. The channel
+    append wakes blocked streams, which observe the marker before reading again
+    and exit without replaying or advancing a removed/reset cursor.
+    """
+    return ROOT / f"{safe_name(channel)}.{safe_name(agent)}.stream.stop"
+
+
 def last_activity(file: Path, name: str):
     """(newest_ts_from_name, left_flag). left_flag True if its last line was a leave."""
     last_ts, left = None, False
@@ -565,23 +575,30 @@ def cmd_stream(args) -> int:
     delivered inline as it arrives, with no re-arm between messages. Blocks on
     filesystem events while idle (zero CPU on macOS/Linux; bounded sleep poll
     elsewhere). Each line is flushed immediately so the monitor sees it in real
-    time through the pipe. Exits 0 only when a peer leaves the channel, so the
-    agent can tear the monitor down (e.g. via `background_stop`)."""
+    time through the pipe. Peer leaves are delivered as messages and surfaced
+    with a marker, but the stream stays armed because idle channels are cheap.
+    Pass --exit-on-leave to restore the old two-party teardown behavior."""
     file, cursor = paths(args.channel, args.agent)
     ensure(file)
     me = safe_name(args.agent)
+    stop_file = stream_stop_file(args.channel, args.agent)
+    try:
+        stop_file.unlink()
+    except FileNotFoundError:
+        pass
     while True:
+        if stop_file.exists():
+            return 0
         messages, total = collect_new(file, cursor, me)
         for obj in messages:
             print(fmt(obj), flush=True)
-        # Exit when a peer leaves so the host can tear the monitor down — UNLESS --stay,
-        # which keeps streaming through other peers' leaves (busy channels). The leave
-        # message itself is still delivered above either way.
-        if (not getattr(args, "stay", False)
-                and any(str(m.get("text", "")).strip() == "left the channel"
-                        for m in messages)):
+        # Peer leaves are ordinary channel events for persistent monitors. Surface the
+        # marker, but keep watching unless the caller explicitly asks for two-party
+        # teardown behavior.
+        if any(str(m.get("text", "")).strip() == "left the channel" for m in messages):
             print("[stream: a peer left the channel]", flush=True)
-            return 0
+            if getattr(args, "exit_on_leave", False):
+                return 0
         wait_for_file_change(file, total, None, args.interval)
 
 
@@ -606,23 +623,29 @@ def cmd_leave(args) -> int:
     my_iid = instance_id()
     of = owner_file(args.channel, args.agent)
     owner = of.read_text().strip() if of.exists() else ""
-    # Refuse to leave/unlink a name a DIFFERENT live instance owns. Otherwise leaving under
-    # a stale name (e.g. the pre-rename name after a collision) would delete the rightful
-    # owner's cursor + owner files AND inject a spurious 'left the channel' that trips the
-    # owner's own wait/stream terminal-leave logic. Destructive path -> hard refuse.
+    # Refuse to leave under a name a DIFFERENT live instance owns. Otherwise a stale
+    # pre-rename name would stop the rightful owner's streams, remove its owner file,
+    # and inject a spurious departure event. Destructive path -> hard refuse.
     if my_iid and owner and owner != my_iid and name_recently_active(file, safe_name(args.agent)):
         print(f"error: '{safe_name(args.agent)}' is owned by another live instance "
-              f"({owner[:8]}); refusing to leave/unlink it. Use your own (renamed) name.",
+              f"({owner[:8]}); refusing to leave under it. Use your own (renamed) name.",
               file=sys.stderr)
         return 2
+    # Ask every persistent stream under this channel/name to exit BEFORE the
+    # departure append wakes it. Preserve the cursor: deleting it while a stream
+    # is alive makes read_cursor() fall back to zero and replays the transcript.
+    # A later setup() deliberately resets the cursor to the then-current end.
+    stream_stop_file(args.channel, args.agent).write_text(
+        f"leave {int(time.time())}\n", encoding="utf-8"
+    )
     send_args = argparse.Namespace(channel=args.channel, agent=args.agent, text=["left the channel"])
     rc = cmd_send(send_args)
-    for extra in (cursor, of):
-        try:
-            extra.unlink()
-        except FileNotFoundError:
-            pass
+    try:
+        of.unlink()
+    except FileNotFoundError:
+        pass
     print(f"left channel={safe_name(args.channel)} agent={safe_name(args.agent)}")
+    print(f"cursor preserved={cursor}; next setup resets it to the channel end")
     return rc
 
 
@@ -819,8 +842,10 @@ def build_parser():
     stream.add_argument("--interval", type=float, default=0.25,
                         help="fallback sleep interval when filesystem events are unavailable")
     stream.add_argument("--stay", action="store_true",
-                        help="keep streaming when OTHER peers leave (busy multi-peer "
-                             "channels); default exits on any peer leave")
+                        help="deprecated compatibility no-op; stream now stays armed "
+                             "through peer leaves by default")
+    stream.add_argument("--exit-on-leave", action="store_true",
+                        help="exit when any peer leaves (old two-party teardown behavior)")
     stream.set_defaults(func=cmd_stream)
 
     watch_start = sub.add_parser("watch-start", help="start a zero-inference background channel watcher")

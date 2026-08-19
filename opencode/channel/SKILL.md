@@ -25,7 +25,8 @@ Agents are turn-based. Do not start a background watcher and expect its output t
 >
 > - **`monitor`** — arm `python3 <HELPER> stream <channel> <agent>`. `stream` prints
 >   one line per message and never exits, so `monitor` wakes you inline on each
->   message, no re-arm. `background_stop` to stop (it also self-exits on peer leave).
+>   message, no re-arm. Peer leaves are reported but do not stop a busy multi-peer
+>   stream. Use `leave` when done; use `background_stop` if the monitor remains live.
 > - **`bash_background`** — wake-on-exit, like Claude's `run_in_background`. Arm
 >   `python3 <HELPER> wait <channel> <agent> --timeout 0`; it wakes you when `wait`
 >   exits on the next message (read its logfile), then re-arm. `background_stop` to stop.
@@ -51,7 +52,7 @@ use the raw session title as the agent name — use the helper's `name` command
 
 The two agents on a channel must use different agent names. If a generated name might collide, ask the user for an explicit one.
 
-**Fork/collision safety + newer flags.** `setup` stamps a per-session instance-id and, if a *different* live session already holds the requested name (e.g. a forked session that inherited it), prints a WARNING and auto-adopts a unique name — **use the name `setup` prints**. Two instances that share a session id AND the `CLAUDE_CODE_CHILD_SESSION` marker still need a unique name or a distinct `CLAUDE_CHANNEL_IID`. To send a message containing shell metacharacters (backticks, parens, globs, `$`), use `send … --stdin` and pipe/heredoc the body (`printf '%s' "$msg" | … send ch me --stdin`) so the caller's shell can't execute them; a lone `-`/`--stdin` must be the only token or it errors. On a busy channel where peers come and go, pass `--stay` to `wait`/`stream` so one peer leaving doesn't stop your watch.
+**Fork/collision safety + newer flags.** `setup` stamps a per-session instance-id and, if a *different* live session already holds the requested name (e.g. a forked session that inherited it), prints a WARNING and auto-adopts a unique name — **use the name `setup` prints**. Two instances that share a session id AND the `CLAUDE_CODE_CHILD_SESSION` marker still need a unique name or a distinct `CLAUDE_CHANNEL_IID`. To send a message containing shell metacharacters (backticks, parens, globs, `$`), use `send … --stdin` and pipe/heredoc the body (`printf '%s' "$msg" | … send ch me --stdin`) so the caller's shell can't execute them; a lone `-`/`--stdin` must be the only token or it errors. On a busy channel where peers come and go, `stream` keeps watching through peer leaves by default; pass `--stay` to `wait` if one-shot wait should also keep watching after a leave.
 
 ## Agent-Internal Helper
 
@@ -75,6 +76,9 @@ python3 <HELPER> setup <channel> <agent>
 # Append a JSON message. The helper handles JSON escaping and newlines.
 python3 <HELPER> send <channel> <agent> "hello"
 
+# For arbitrary text, bypass shell interpolation entirely.
+printf '%s' "$message" | python3 <HELPER> send <channel> <agent> --stdin
+
 # Read existing transcript without moving the cursor.
 python3 <HELPER> history <channel> <agent>
 
@@ -89,9 +93,9 @@ python3 <HELPER> listen <channel> <agent> --timeout 30
 # the harness re-invokes the agent after background command completion.
 python3 <HELPER> wait <channel> <agent>
 
-# Stream peer messages to stdout FOREVER, one line each (never exits until a peer
-# leaves). Arm this under a per-line monitor tool (OpenCode's `monitor`) so each
-# message wakes you inline with no re-arm. See the OpenCode note above.
+# Stream peer messages to stdout FOREVER, one line each. Peer leaves are printed
+# but do not stop the stream. Arm this under a per-line monitor tool
+# (OpenCode's `monitor`) so each message wakes you inline with no re-arm.
 python3 <HELPER> stream <channel> <agent>
 
 # Start a zero-inference watcher in the background. It writes a watch log and,
@@ -104,7 +108,7 @@ python3 <HELPER> watch-status <channel> <agent>
 python3 <HELPER> watch-log <channel> <agent> --lines 20
 python3 <HELPER> watch-stop <channel> <agent>
 
-# Announce departure and remove this agent's cursor.
+# Stop this agent's streams, announce departure, and preserve its cursor until setup.
 python3 <HELPER> leave <channel> <agent>
 ```
 
@@ -137,7 +141,9 @@ When joining a channel:
    - When the user gives a message, send it and listen again.
    - When `listen` returns peer messages, show them to the user and respond as requested.
    - When `listen` times out and the user is waiting for the peer, run `listen` again.
-   - If a peer message is `left the channel`, report that the peer left and stop polling.
+   - If a peer message is `left the channel`, report that the peer left. Keep a
+     live `stream` armed only while channel work continues; if the task is
+     complete, leave the channel so the stream exits.
    - Before answering "no response" or ending the turn, check the channel one more time.
 
 If the user wants to wait without spending inference tokens, use OpenCode's
@@ -151,7 +157,12 @@ answering.
 
 Treat these user messages as leave commands: `leave`, `leave the channel`, `exit`, `quit`, `stop watching`, `/leave`, `/exit`, `/quit`, `disconnect`, `close the channel`, `done`, `bye`, `goodbye`.
 
-On a leave command, run `leave`, report that you left, and stop polling.
+On a leave command, run `leave`, report that you left, and stop polling. The
+helper signals live bundled streams before appending the departure message and
+preserves the cursor. Never delete or reset the cursor while a receiver is live:
+that makes the receiver restart at position zero and replay the transcript. If
+the host still shows the monitor after `leave`, stop it with `background_stop`
+before reusing the same agent name.
 
 ## Protocol Details
 
@@ -172,5 +183,9 @@ Each agent's cursor lives at:
 ```text
 /tmp/claude-channels/<channel>.<agent>.cursor
 ```
+
+`leave` preserves this cursor; the next `setup` resets it to the current channel
+end. This prevents a late-running receiver from treating a missing cursor as
+position zero.
 
 Keep messages concise and single-purpose. For long code, summaries, or diffs, send a short description and let the user decide whether to relay details.

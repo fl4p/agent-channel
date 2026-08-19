@@ -27,8 +27,11 @@ Agents are turn-based. A channel watcher only enters context while the agent is 
 > running, so Codex is re-entered by synthetic
 > background-output user messages. No re-arm is needed. Do not also run
 > foreground `poll`/`listen`/`wait` while `stream` is live because they share the
-> same cursor. Keep the returned `session_id`; stop it with `write_stdin` Ctrl-C
-> (`"\u0003"`) if the user leaves before the stream exits.
+> same cursor. Keep the returned `session_id`. If the user stops watching without
+> leaving, stop it with `write_stdin` Ctrl-C (`"\u0003"`). On `leave`, the helper
+> writes a cooperative stop marker before announcing departure, so bundled
+> streams exit without replaying the transcript; use Ctrl-C only if the host still
+> reports the stream as live afterward.
 >
 > **Stock Codex: use foreground `listen`, not background `wait`.** If the
 > `wake_on_output` parameter is absent, Codex cannot receive asynchronous
@@ -55,7 +58,7 @@ Infer these from the user's request:
 
 The two agents on a channel must use different agent names. If a generated name might collide, ask the user for an explicit one.
 
-**Fork/collision safety + newer flags.** `setup` stamps a per-session instance-id and, if a *different* live session already holds the requested name (e.g. a forked session that inherited it), prints a WARNING and auto-adopts a unique name — **use the name `setup` prints**. Two instances that share a session id AND the `CLAUDE_CODE_CHILD_SESSION` marker still need a unique name or a distinct `CLAUDE_CHANNEL_IID`. To send a message containing shell metacharacters (backticks, parens, globs, `$`), use `send … --stdin` and pipe/heredoc the body (`printf '%s' "$msg" | … send ch me --stdin`) so the caller's shell can't execute them; a lone `-`/`--stdin` must be the only token or it errors. On a busy channel where peers come and go, pass `--stay` to `wait`/`stream` so one peer leaving doesn't stop your watch.
+**Fork/collision safety + newer flags.** `setup` stamps a per-session instance-id and, if a *different* live session already holds the requested name (e.g. a forked session that inherited it), prints a WARNING and auto-adopts a unique name — **use the name `setup` prints**. Two instances that share a session id AND the `CLAUDE_CODE_CHILD_SESSION` marker still need a unique name or a distinct `CLAUDE_CHANNEL_IID`. To send a message containing shell metacharacters (backticks, parens, globs, `$`), use `send … --stdin` and pipe/heredoc the body (`printf '%s' "$msg" | … send ch me --stdin`) so the caller's shell can't execute them; a lone `-`/`--stdin` must be the only token or it errors. On a busy channel where peers come and go, `stream` keeps watching through peer leaves by default; pass `--stay` to `wait` if one-shot wait should also keep watching after a leave.
 
 ## Agent-Internal Helper
 
@@ -78,6 +81,9 @@ python3 <HELPER> setup <channel> <agent>
 
 # Append a JSON message. The helper handles JSON escaping and newlines.
 python3 <HELPER> send <channel> <agent> "hello"
+
+# For arbitrary text, bypass shell interpolation entirely.
+printf '%s' "$message" | python3 <HELPER> send <channel> <agent> --stdin
 
 # Read existing transcript without moving the cursor.
 python3 <HELPER> history <channel> <agent>
@@ -107,7 +113,7 @@ python3 <HELPER> watch-status <channel> <agent>
 python3 <HELPER> watch-log <channel> <agent> --lines 20
 python3 <HELPER> watch-stop <channel> <agent>
 
-# Announce departure and remove this agent's cursor.
+# Stop this agent's streams, announce departure, and preserve its cursor until setup.
 python3 <HELPER> leave <channel> <agent>
 ```
 
@@ -115,7 +121,8 @@ The helper prints peer messages as `[from] text`. It skips messages from the cur
 
 `stream` is the Codex output-wake path when `wake_on_output` exists. It shares
 the same cursor as `poll`/`listen`/`wait`, so do not use foreground receives
-while it is live.
+while it is live. `leave` asks every bundled stream under the same channel and
+agent name to exit before it appends the departure event.
 
 `watch-start` is a separate log/desktop-notification daemon. It runs outside
 inference, skips this agent's own messages, writes
@@ -149,7 +156,9 @@ When joining a channel:
      after sending; otherwise listen again.
    - When foreground `listen` returns peer messages, show them to the user and respond as requested.
    - When `listen` times out and the user is waiting for the peer, run `listen` again.
-   - If a peer message is `left the channel`, report that the peer left and stop polling.
+   - If a peer message is `left the channel`, report that the peer left. Keep a
+     live `stream` armed only when channel work continues (for example, other
+     peers remain); if the task is complete, leave the channel so the stream exits.
    - Before answering "no response" or ending the turn, check the channel one more time.
 
 If the user explicitly asks for desktop/log-only monitoring and
@@ -161,7 +170,12 @@ foreground `listen` before answering.
 
 Treat these user messages as leave commands: `leave`, `leave the channel`, `exit`, `quit`, `stop watching`, `/leave`, `/exit`, `/quit`, `disconnect`, `close the channel`, `done`, `bye`, `goodbye`.
 
-On a leave command, run `leave`, report that you left, and stop polling.
+On a leave command, run `leave`, report that you left, and stop polling. The
+helper signals live bundled streams before appending the departure message and
+does **not** delete the cursor. Deleting or resetting a cursor while a receiver
+is live can replay the entire transcript. If the host still shows a stream after
+`leave`, stop that session with the host's control (`write_stdin` Ctrl-C in
+Codex) before reusing the same agent name.
 
 ## Protocol Details
 
@@ -182,5 +196,9 @@ Each agent's cursor lives at:
 ```text
 /tmp/claude-channels/<channel>.<agent>.cursor
 ```
+
+`leave` preserves this cursor; the next `setup` resets it to the current channel
+end. This prevents a late-running receiver from treating a missing cursor as
+position zero.
 
 Keep messages concise and single-purpose. For long code, summaries, or diffs, send a short description and let the user decide whether to relay details.
