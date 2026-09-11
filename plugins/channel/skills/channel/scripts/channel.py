@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import ctypes
 import ctypes.util
 import hashlib
@@ -74,14 +75,54 @@ def line_count(file: Path) -> int:
 
 
 def read_cursor(cursor: Path) -> int:
+    # Split since 2026-09-11 (review F7): the old blanket `except: return 0`
+    # turned EVERY read failure into "replay from zero". First use
+    # (FileNotFoundError) and a truncated/garbage cursor left by a
+    # pre-atomic writer (ValueError) still recover from zero - the second
+    # is the documented recovery for a corrupted cursor, and atomic writes
+    # (write_cursor, below) make new truncation impossible. Every other
+    # error - permissions, I/O, a directory in the way - propagates: a
+    # broken /tmp is not a replay request.
     try:
         return int(cursor.read_text().strip())
-    except Exception:
+    except FileNotFoundError:
+        return 0
+    except ValueError:
         return 0
 
 
 def write_cursor(cursor: Path, value: int):
-    cursor.write_text(f"{value}\n")
+    # ATOMIC + bounded-retry replace, since 2026-09-11. write_text alone is
+    # truncate-then-write, and read_cursor() maps an unreadable
+    # (mid-truncation, empty) cursor to 0 - which means REPLAY THE WHOLE
+    # CHANNEL. Observed live on channel `otab`: a long-running `stream`
+    # under a per-line monitor and a foreground `poll`/`listen` share one
+    # cursor file; their writes raced, the stream read the truncated file,
+    # returned to position 0, and the monitor re-delivered every peer
+    # message as "new output". Twice. The temp file is pid-suffixed so two
+    # concurrent writers cannot clobber each other's temp, and os.replace()
+    # is atomic on POSIX - a reader sees either the old value or the new
+    # one, never empty. On Windows, a reader holding the destination
+    # without FILE_SHARE_DELETE can fail the replace (review F3); retry
+    # bounded, and if it still fails, propagate - the cursor file itself
+    # stays intact either way. A writer dying between the temp write and
+    # the replace leaves one orphan .tmp (review F4); nothing in this
+    # helper scans the directory, so it is inert garbage, and the finally
+    # removes it on every clean exit.
+    tmp = cursor.with_name(f"{cursor.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(f"{value}\n")
+        for attempt in range(5):
+            try:
+                os.replace(tmp, cursor)
+                return
+            except PermissionError:
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def instance_id() -> str:
@@ -372,19 +413,78 @@ def cmd_send(args) -> int:
     return 0
 
 
+@contextlib.contextmanager
+def _cursor_lock(cursor: Path):
+    """Serialize one receive transaction against other collectors on the
+    same cursor (2026-09-11 review F1). Atomic cursor writes alone do not
+    close the race: A counts 100 lines, a peer advances the cursor to 101,
+    and A's `total < last` check then false-detects a channel reset, replays
+    the whole transcript and rolls the cursor back to 100. The lock spans
+    count -> read -> collect -> advance as one unit. fcntl on POSIX, msvcrt
+    on Windows; if neither exists the transaction runs unlocked - this is
+    correctness under concurrency, best-effort where the platform offers
+    nothing. Deliberately NOT a monotonic max(old,new) on write_cursor:
+    that would break the documented channel-reset recovery (collect_new
+    restarting at zero when the file is shorter than the cursor)."""
+    fh = None
+    how = None
+    try:
+        lock_path = cursor.with_name(cursor.name[: -len(".cursor")] + ".lock")
+        fh = open(lock_path, "a")
+        fd = fh.fileno()
+        if sys.platform == "win32":
+            import msvcrt
+            for _ in range(10):
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    how = "msvcrt"
+                    break
+                except OSError:
+                    time.sleep(1.0)
+            if how is None:
+                raise OSError("cursor lock retries exhausted")
+        else:
+            try:
+                import fcntl
+            except ImportError:
+                fcntl = None
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                how = "fcntl"
+        yield
+    finally:
+        if fh is not None:
+            if sys.platform == "win32" and how == "msvcrt":
+                try:
+                    import msvcrt
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+            elif how == "fcntl":
+                try:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            fh.close()
+
+
 def collect_new(file: Path, cursor: Path, me: str):
-    total = line_count(file)
-    last = read_cursor(cursor)
-    if total < last:
-        last = 0
-    my_iid = instance_id()
-    messages = []
-    for _lineno, line in iter_lines_after(file, last):
-        obj = parse_line(line)
-        if obj and not is_own(obj, me, my_iid):
-            messages.append(obj)
-    write_cursor(cursor, total)
-    return messages, total
+    # One transaction under the cursor lock - see _cursor_lock for the race
+    # this closes and why the advance cannot be split out of it.
+    with _cursor_lock(cursor):
+        total = line_count(file)
+        last = read_cursor(cursor)
+        if total < last:
+            last = 0
+        my_iid = instance_id()
+        messages = []
+        for _lineno, line in iter_lines_after(file, last):
+            obj = parse_line(line)
+            if obj and not is_own(obj, me, my_iid):
+                messages.append(obj)
+        write_cursor(cursor, total)
+        return messages, total
 
 
 # --- Linux inotify receive path (stdlib ctypes; no third-party deps) --------
@@ -699,22 +799,27 @@ def cmd_watch_run(args) -> int:
     my_iid = instance_id()
     try:
         while True:
-            total = line_count(file)
-            last = read_cursor(cursor)
-            if total < last:
-                last = 0
-            lines = []
-            for _lineno, line in iter_lines_after(file, last):
-                obj = parse_line(line)
-                if obj and not is_own(obj, me, my_iid):
-                    lines.append(fmt(obj))
+            # Same receive transaction as collect_new, under the same lock
+            # (review F1). The slow parts - log write, desktop notify - run
+            # after the cursor advance so nothing holds the lock through
+            # them; the advance itself cannot be split from the count/read.
+            with _cursor_lock(cursor):
+                total = line_count(file)
+                last = read_cursor(cursor)
+                if total < last:
+                    last = 0
+                lines = []
+                for _lineno, line in iter_lines_after(file, last):
+                    obj = parse_line(line)
+                    if obj and not is_own(obj, me, my_iid):
+                        lines.append(fmt(obj))
+                write_cursor(cursor, total)
             if lines:
                 with log_file.open("a", encoding="utf-8") as fh:
                     for line in lines:
                         fh.write(line + "\n")
                 if args.desktop:
                     notify_desktop(f"{safe_name(args.channel)} channel", lines[-1])
-            write_cursor(cursor, total)
             wait_for_file_change(file, total, None, args.interval)
     except KeyboardInterrupt:
         return 0
