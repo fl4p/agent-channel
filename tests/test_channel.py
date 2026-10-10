@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+import importlib.util
 from pathlib import Path
 
 
@@ -101,6 +102,22 @@ class ChannelHelperTests(unittest.TestCase):
 
         record = json.loads((self.channel_dir / "safe.ndjson").read_text())
         self.assertEqual(record["text"], "use `rg` and $(uname) * [x] next")
+
+
+class ParseLineTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("channel_script", HELPER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cls.parse_line = staticmethod(module.parse_line)
+
+    def test_parse_line_accepts_only_json_objects(self):
+        self.assertEqual(self.parse_line('{"empty": ""}'), {"empty": ""})
+        self.assertEqual(self.parse_line('{"nested": {"items": []}}'), {"nested": {"items": []}})
+        for line in ("", "{", "null", "[]", '"text"', "42", "true"):
+            with self.subTest(line=line):
+                self.assertIsNone(self.parse_line(line))
 
 
 if __name__ == "__main__":
